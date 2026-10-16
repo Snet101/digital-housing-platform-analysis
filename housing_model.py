@@ -1,229 +1,311 @@
+"""Reproducible rental prediction and explicitly synthetic model recovery."""
 
-#Libraries
-import pandas as pd
+from __future__ import annotations
+import argparse
+import hashlib
+import importlib.metadata
+import json
+from pathlib import Path
+import platform
+import subprocess
+
 import numpy as np
-from ucimlrepo import fetch_ucirepo
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, roc_auc_score
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.metrics import mean_squared_error, roc_auc_score, accuracy_score
+from lightgbm import LGBMRegressor, LGBMClassifier
 
-def rmse(y_true, y_pred):
-    return np.sqrt(mean_squared_error(y_true, y_pred))
+OBSERVED_NUMERIC = ["bedrooms", "bathrooms", "square_feet", "description_length", "amenities_count"]
+OBSERVED_CATEGORY = ["category", "cityname"]
+SYNTHETIC_NUMERIC = OBSERVED_NUMERIC + ["price", "multihomed", "exposure_score", "platform_share", "hhi"]
+SYNTHETIC_CATEGORY = OBSERVED_CATEGORY + ["platform"]
+PLATFORMS = ["Craigslist", "Zillow", "Apartments.com"]
+REQUIRED = [
+    "price",
+    "bedrooms",
+    "bathrooms",
+    "square_feet",
+    "category",
+    "cityname",
+    "body",
+    "amenities",
+    "currency",
+    "price_type",
+]
 
-import lightgbm as lgb
-import shap
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-#dataset
-data = fetch_ucirepo(id=555)
-df = pd.concat([data.data.features, data.data.targets], axis=1)
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-#numeric columns
-df['price'] = pd.to_numeric(df['price'], errors='coerce')
-df['bedrooms'] = pd.to_numeric(df['bedrooms'], errors='coerce')
-df['bathrooms'] = pd.to_numeric(df['bathrooms'], errors='coerce')
-df['square_feet'] = pd.to_numeric(df['square_feet'], errors='coerce')
 
-# keep only needed cols and drop NA
-df = df[['price', 'bedrooms', 'bathrooms', 'square_feet',
-         'category', 'cityname', 'body', 'amenities']].dropna()
-df = df[df['price'] < 10000]
-df['neighborhood'] = df['cityname']
+def save_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
-#Simulate platforms with heterogeneous neighborhood mixes
 
-platforms = ['Craigslist', 'Zillow', 'Apartments.com']
+def clean(raw):
+    missing = set(REQUIRED) - set(raw.columns)
+    if missing:
+        raise ValueError(f"Missing input columns: {sorted(missing)}")
+    df = raw[REQUIRED].copy()
+    df.insert(0, "row_id", np.arange(len(df)))
+    for col in ["price", "bedrooms", "bathrooms", "square_feet"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    for col in ["category", "cityname", "currency", "price_type"]:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    keep = (
+        df.price.gt(0)
+        & df.price.lt(10000)
+        & df.square_feet.gt(0)
+        & df.bedrooms.ge(0)
+        & df.bathrooms.ge(0)
+        & df.cityname.ne("")
+        & df.category.ne("")
+        & df.currency.str.upper().eq("USD")
+        & df.price_type.str.casefold().eq("monthly")
+    )
+    df = df.loc[keep].copy()
+    df["description_length"] = df.body.fillna("").astype(str).str.len()
+    df["amenities_count"] = (
+        df.amenities.fillna("").astype(str).map(lambda x: sum(bool(v.strip()) for v in x.split(",")))
+    )
+    # Identical retained source records must not count as independent observations.
+    df = df.drop_duplicates(REQUIRED).reset_index(drop=True)
+    if len(df) < 20 or df.cityname.nunique() < 4:
+        raise ValueError("Need at least 20 cleaned records across four cities")
+    return df
 
-#one random platform mix per neighborhood
-neighs = df['neighborhood'].unique()
-mixes = np.random.dirichlet([1, 1, 1], size=len(neighs))
-mix_df = pd.DataFrame(mixes, columns=['p_craigslist', 'p_zillow', 'p_apts'])
-mix_df['neighborhood'] = neighs
 
-#attach mix to listings
-df = df.merge(mix_df, on='neighborhood', how='left')
+def split_cities(df, seed):
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
+    train, test = next(splitter.split(df, groups=df.cityname))
+    labels = np.full(len(df), "test", dtype=object)
+    labels[train] = "train"
+    assert not set(df.iloc[train].cityname) & set(df.iloc[test].cityname)
+    return labels
 
-def sample_platform(row):
-    return np.random.choice(
-        platforms,
-        p=[row['p_craigslist'], row['p_zillow'], row['p_apts']]
+
+def simulate(df, seed, curvature=10.0):
+    """HHI uses listing counts only; no rent-derived aggregate is constructed."""
+    rng = np.random.default_rng(seed)
+    result = df.copy()
+    cities = sorted(result.cityname.unique())
+    mixes = dict(zip(cities, rng.dirichlet([1, 1, 1], size=len(cities)), strict=True))
+    result["platform"] = [rng.choice(PLATFORMS, p=mixes[c]) for c in result.cityname]
+    counts = result.groupby(["cityname", "platform"]).size().rename("count").reset_index()
+    counts["platform_share"] = counts["count"] / counts.groupby("cityname")["count"].transform("sum")
+    hhi = counts.assign(square=counts.platform_share**2).groupby("cityname").square.sum().rename("hhi")
+    result = result.merge(
+        counts[["cityname", "platform", "platform_share"]],
+        on=["cityname", "platform"],
+        how="left",
+        validate="many_to_one",
+        sort=False,
+    )
+    result = result.join(hhi, on="cityname", validate="many_to_one")
+    assert len(result) == len(df) and result.row_id.is_unique
+    result["landlord_id"] = rng.integers(1000, 2000, size=len(result))
+    result["multihomed"] = (result.landlord_id % 7 == 0).astype(int)
+    result["exposure_score"] = result.platform.map(dict(zip(PLATFORMS, [1.0, 1.5, 1.3], strict=True))) * (
+        1 + 0.8 * result.multihomed
+    )
+    result["views"] = (result.exposure_score * 2000 / result.price + rng.normal(0, 40, len(result))).clip(lower=0)
+    result["time_on_market"] = (
+        28
+        + curvature * (result.hhi - 0.5) ** 2
+        - 3 * result.exposure_score
+        + result.price / 500
+        + rng.normal(0, 2, len(result))
+    ).clip(1, 60)
+    result["rented"] = (result.time_on_market < 20).astype(int)
+    return result
+
+
+def preprocessor(synthetic=False):
+    numeric = SYNTHETIC_NUMERIC if synthetic else OBSERVED_NUMERIC
+    category = SYNTHETIC_CATEGORY if synthetic else OBSERVED_CATEGORY
+    return ColumnTransformer(
+        [
+            ("numeric", SimpleImputer(strategy="median"), numeric),
+            ("category", OneHotEncoder(handle_unknown="ignore", sparse_output=True), category),
+        ],
+        sparse_threshold=1.0,
+        remainder="drop",
+        verbose_feature_names_out=True,
     )
 
-df['platform'] = df.apply(sample_platform, axis=1)
+
+def fit_evaluate(df, seed):
+    train, test = df.loc[df.split.eq("train")], df.loc[df.split.eq("test")]
+    metrics, predictions = {}, df.loc[df.split.eq("test"), ["row_id", "cityname"]].copy()
+    for target in ["price", "time_on_market", "views", "rented"]:
+        binary = target == "rented"
+        synthetic = target != "price"
+        prep = preprocessor(synthetic)
+        x_train = prep.fit_transform(train)
+        x_test = prep.transform(test)
+        settings = dict(
+            n_estimators=100,
+            learning_rate=0.05,
+            num_leaves=15,
+            min_child_samples=10,
+            verbosity=-1,
+            random_state=seed,
+            n_jobs=1,
+            deterministic=True,
+            force_col_wise=True,
+        )
+        if binary and train[target].nunique() < 2:
+            model = DummyClassifier(strategy="prior")
+        else:
+            model = (LGBMClassifier if binary else LGBMRegressor)(**settings)
+        baseline = DummyClassifier(strategy="prior") if binary else DummyRegressor(strategy="mean")
+        model.fit(x_train, train[target])
+        baseline.fit(x_train, train[target])
+
+        def predict(estimator):
+            if not binary:
+                return estimator.predict(x_test)
+            probabilities = estimator.predict_proba(x_test)
+            return (
+                probabilities[:, list(estimator.classes_).index(1)] if 1 in estimator.classes_ else np.zeros(len(test))
+            )
+
+        pred, base = predict(model), predict(baseline)
+        result = {
+            "kind": "synthetic_model_recovery" if synthetic else "observed_rent_prediction",
+            "test_rows": len(test),
+            "features": list(prep.get_feature_names_out()),
+            "estimator": type(model).__name__,
+        }
+        if binary:
+            defined = test[target].nunique() == 2
+            result.update(
+                auc=float(roc_auc_score(test[target], pred)) if defined else None,
+                baseline_auc=float(roc_auc_score(test[target], base)) if defined else None,
+                auc_note=None if defined else "Undefined: test partition has one class",
+                accuracy=float(accuracy_score(test[target], pred >= 0.5)),
+                baseline_accuracy=float(accuracy_score(test[target], base >= 0.5)),
+            )
+        else:
+            result.update(
+                rmse=float(np.sqrt(mean_squared_error(test[target], pred))),
+                baseline_rmse=float(np.sqrt(mean_squared_error(test[target], base))),
+            )
+        predictions[f"{target}_actual"] = test[target].to_numpy()
+        predictions[f"{target}_prediction"] = pred
+        predictions[f"{target}_baseline"] = base
+        metrics[target] = result
+    return metrics, predictions
 
 
-#Platform-level dispersion
+def ols_checks(df):
+    """Alternate estimator on the exact saved training realization, not new data."""
+    import statsmodels.formula.api as smf
 
-platform_dispersion = (
-    df.groupby(['platform', 'neighborhood'])['price']
-      .std()
-      .reset_index()
-)
-platform_dispersion.rename(columns={'price': 'platform_neigh_std'}, inplace=True)
-df = df.merge(platform_dispersion, on=['platform', 'neighborhood'], how='left')
-
-#Multihoming + exposure
-df['landlord_id'] = np.random.randint(1000, 2000, size=len(df))
-df['multihomed'] = df['landlord_id'] % 7 == 0  # ~14%
-
-platform_weights = {'Craigslist': 1.0, 'Zillow': 1.5, 'Apartments.com': 1.3}
-df['exposure_score'] = df['platform'].map(platform_weights) * (1 + df['multihomed'] * 0.8)
-
-df['views'] = (
-    df['exposure_score'] * (2000 / df['price'])
-    + np.random.normal(0, 40, size=len(df))
-)
-
-#Proper platform share + HHI
-
-# counts per neighborhood/platform
-counts = (
-    df.groupby(['neighborhood', 'platform'])['price']
-      .count()
-      .reset_index(name='platform_count')
-)
-
-#total listings per neighborhood
-total = (
-    df.groupby('neighborhood')['price']
-      .count()
-      .reset_index(name='total_count')
-)
-
-# merge and compute share
-counts = counts.merge(total, on='neighborhood')
-counts['platform_share_in_neighborhood'] = (
-    counts['platform_count'] / counts['total_count']
-)
-
-# HHI per neighborhood
-hhi = (
-    counts
-    .groupby('neighborhood')['platform_share_in_neighborhood']
-    .apply(lambda s: (s**2).sum())
-    .reset_index(name='platform_concentration_hhi')
-)
-
-# merge back to listing level
-df = df.merge(
-    counts[['neighborhood', 'platform', 'platform_count',
-            'total_count', 'platform_share_in_neighborhood']],
-    on=['neighborhood', 'platform']
-)
-df = df.merge(hhi, on='neighborhood')
-
-#Time-on-market with U-shape in HHI
-
-noise = np.random.normal(0, 2, size=len(df))
-df['time_on_market'] = (
-    28
-    + 10 * (df['platform_concentration_hhi'] - 0.5)**2  # convex
-    - 3 * df['exposure_score']
-    + (df['price'] / 500)
-    + noise
-).clip(1, 60)
-
-df['rented'] = (df['time_on_market'] < 20).astype(int)
-
-# 8. Feature engineering + dummies
-df['description_length'] = df['body'].fillna('').str.len()
-df['amenities_count'] = df['amenities'].fillna('').apply(lambda x: len(str(x).split(',')))
-
-df = pd.get_dummies(df, columns=['category', 'cityname', 'platform'], drop_first=True)
-
-features = list(dict.fromkeys(
-    [
-        'bedrooms', 'bathrooms', 'square_feet',
-        'description_length', 'amenities_count',
-        'platform_neigh_std',
-        'multihomed', 'exposure_score',
-        'platform_share_in_neighborhood',
-        'platform_concentration_hhi'
-    ]
-    + [c for c in df.columns
-       if c.startswith('category_') or c.startswith('cityname_') or c.startswith('platform_')]
-))
-
-#Train/test split
-X = df[features]
-y_price = df['price']
-y_time = df['time_on_market']
-y_views = df['views']
-y_rented = df['rented']
-
-X_train, X_val, y_price_train, y_price_val = train_test_split(
-    X, y_price, test_size=0.2, random_state=42
-)
-_, _, y_time_train, y_time_val = train_test_split(
-    X, y_time, test_size=0.2, random_state=42
-)
-_, _, y_views_train, y_views_val = train_test_split(
-    X, y_views, test_size=0.2, random_state=42
-)
-_, _, y_rented_train, y_rented_val = train_test_split(
-    X, y_rented, test_size=0.2, random_state=42
-)
-
-# Train LightGBM models
-def train_lgbm(X_train, y_train, task='regression'):
-    params = {
-        'objective': 'regression' if task == 'regression' else 'binary',
-        'metric': 'rmse' if task == 'regression' else 'auc',
-        'learning_rate': 0.05,
-        'verbosity': -1
+    train = df.loc[df.split.eq("train")].copy()
+    forms = {
+        "observed_log_rent": "np.log(price) ~ bedrooms + bathrooms + square_feet + description_length + amenities_count",
+        "synthetic_time_recovery": "time_on_market ~ I((hhi - 0.5)**2) + exposure_score + price",
     }
-    dtrain = lgb.Dataset(X_train, label=y_train)
-    return lgb.train(params, dtrain, num_boost_round=100)
+    rows = []
+    for name, formula in forms.items():
+        subsets = {"all_train": train}
+        if name == "observed_log_rent":
+            lo, hi = train.price.quantile([0.01, 0.99])
+            subsets["trimmed_train"] = train.loc[train.price.between(lo, hi)]
+        for subset, data in subsets.items():
+            design = smf.ols(formula, data=data)
+            rank = np.linalg.matrix_rank(design.exog)
+            if len(data) <= design.exog.shape[1] + 1 or rank < design.exog.shape[1]:
+                rows.append(dict(analysis=name, subset=subset, status="insufficient_rank_or_rows", n=len(data)))
+                continue
+            fit = design.fit(cov_type="HC3")
+            for term in fit.params.index:
+                se = float(fit.bse[term])
+                rows.append(
+                    dict(
+                        analysis=name,
+                        subset=subset,
+                        term=term,
+                        coefficient=float(fit.params[term]),
+                        hc3_se=se if np.isfinite(se) else None,
+                        n=int(fit.nobs),
+                        status="ok" if np.isfinite(se) else "undefined_standard_error",
+                    )
+                )
+    return rows
 
-model_price = train_lgbm(X_train, y_price_train)
-model_time = train_lgbm(X_train, y_time_train)
-model_views = train_lgbm(X_train, y_views_train)
-model_rented = train_lgbm(X_train, y_rented_train, task='binary')
 
-# 11. Evaluation
-pred_price = model_price.predict(X_val)
-pred_time = model_time.predict(X_val)
-pred_views = model_views.predict(X_val)
-pred_rented = model_rented.predict(X_val)
+def run(input_path, out, seed=42, curvature=10.0):
+    if seed < 0 or not np.isfinite(curvature):
+        raise ValueError("Seed must be nonnegative and curvature finite")
+    raw = pd.read_csv(input_path)
+    cleaned = clean(raw)
+    cleaned["split"] = split_cities(cleaned, seed)
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=False)
+    save_json(out / "status.json", {"state": "incomplete"})
+    try:
+        df = simulate(cleaned, seed, curvature)
+        df.to_csv(out / "simulation.csv", index=False)
+        # OLS uses round-tripped saved input, also used by the notebook.
+        df = pd.read_csv(out / "simulation.csv")
+        metrics, predictions = fit_evaluate(df, seed)
+        predictions.to_csv(out / "predictions.csv", index=False)
+        save_json(out / "metrics.json", metrics)
+        save_json(out / "ols.json", ols_checks(df))
+        try:
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+            dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True))
+        except (OSError, subprocess.CalledProcessError):
+            commit, dirty = None, None
+        save_json(
+            out / "provenance.json",
+            {
+                "input_path": str(Path(input_path).resolve()),
+                "input_sha256": digest(input_path),
+                "code_sha256": digest(__file__),
+                "git_commit": commit,
+                "git_dirty": dirty,
+                "simulation_sha256": digest(out / "simulation.csv"),
+                "seed": seed,
+                "curvature": curvature,
+                "raw_rows": len(raw),
+                "cleaned_rows": len(df),
+                "excluded_or_duplicate_rows": len(raw) - len(df),
+                "train_rows": int(df.split.eq("train").sum()),
+                "test_rows": int(df.split.eq("test").sum()),
+                "split": "held-out cities (25% of city groups); all tasks share row IDs",
+                "python": platform.python_version(),
+                "packages": {
+                    p: importlib.metadata.version(p)
+                    for p in ["numpy", "pandas", "scikit-learn", "lightgbm", "statsmodels"]
+                },
+                "output_sha256": {p.name: digest(p) for p in out.iterdir() if p.name != "status.json"},
+            },
+        )
+        save_json(out / "status.json", {"state": "complete"})
+    except Exception as exc:
+        save_json(out / "status.json", {"state": "failed", "error": str(exc)})
+        raise
+    return metrics
 
-print(f"\nPrice RMSE: ${rmse(y_price_val, pred_price):.2f}")
-print(f"Time-on-market RMSE: {rmse(y_time_val, pred_time):.2f} days")
-print(f"Views RMSE: {rmse(y_views_val, pred_views):.2f} views")
-print(f"Rented AUC: {roc_auc_score(y_rented_val, pred_rented):.3f}")
 
-# 12. SHAP (optional — will pop plots)
-explainer_price = shap.TreeExplainer(model_price)
-shap_values_price = explainer_price.shap_values(X_val)
-print("\nSHAP summary for rent price:")
-shap.summary_plot(shap_values_price, X_val)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument(
+        "--out", type=Path, required=True, help="New output directory; existing directories are rejected"
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--curvature", type=float, default=10.0)
+    args = parser.parse_args()
+    print(json.dumps(run(args.input, args.out, args.seed, args.curvature), indent=2))
 
-explainer_rented = shap.TreeExplainer(model_rented)
-shap_values_rented = explainer_rented.shap_values(X_val)
-print("\nSHAP summary for rental success:")
-shap.summary_plot(shap_values_rented, X_val)
 
-# 13. Partial dependence on HHI
-h_min = X['platform_concentration_hhi'].min()
-h_max = X['platform_concentration_hhi'].max()
-h_grid = np.linspace(h_min, h_max, 80)
-
-avg_preds = []
-for h in h_grid:
-    X_tmp = X.copy()
-    X_tmp['platform_concentration_hhi'] = h
-    preds = model_time.predict(X_tmp)
-    avg_preds.append(preds.mean())
-
-from scipy.ndimage import gaussian_filter1d
-smooth_preds = gaussian_filter1d(avg_preds, sigma=1.2)
-
-plt.figure(figsize=(6, 4))
-plt.plot(h_grid, smooth_preds, color='darkred', lw=3, label='LightGBM PD (smoothed)')
-plt.plot(h_grid, avg_preds, color='darkred', ls='--', alpha=0.25, label='raw PD')
-plt.xlabel("Platform Concentration (HHI)")
-plt.ylabel("Predicted Time on Market")
-plt.title("Predicted Relationship: Concentration vs Time-on-Market")
-plt.legend()
-plt.grid(alpha=0.25)
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()
