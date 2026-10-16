@@ -1,0 +1,52 @@
+{
+  "source": {
+    "uci_id": 555,
+    "acquired_at_utc": "2026-10-16T01:17:27.848917+00:00",
+    "source": "https://archive.ics.uci.edu/dataset/555/apartment+for+rent+classified",
+    "rows": 99826,
+    "sha256": "dba71c5b6947a7524fc4bd4ab597daaa5f2c40ac1b0435129e392add607be291",
+    "note": "Snapshot bytes, not a claim that upstream source will remain unchanged"
+  },
+  "counts": {
+    "raw_rows": 99826,
+    "cleaned_rows": 98438,
+    "train_rows": 77200,
+    "test_rows": 21238
+  },
+  "seed": 42,
+  "curvature": 10.0,
+  "code_sha256": "eb5ac0cb03d6cc0f8ca0388dd86f5814ed0fe15711e273020001f9c69f1777aa",
+  "metrics": {
+    "price": {
+      "kind": "observed_rent_prediction",
+      "test_rows": 21238,
+      "estimator": "LGBMRegressor",
+      "rmse": 589.2625415034441,
+      "baseline_rmse": 671.9166111587806
+    },
+    "time_on_market": {
+      "kind": "synthetic_model_recovery",
+      "test_rows": 21238,
+      "estimator": "LGBMRegressor",
+      "rmse": 1.9857141405370238,
+      "baseline_rmse": 2.773609692748472
+    },
+    "views": {
+      "kind": "synthetic_model_recovery",
+      "test_rows": 21238,
+      "estimator": "LGBMRegressor",
+      "rmse": 24.020887532473438,
+      "baseline_rmse": 24.024101161766204
+    },
+    "rented": {
+      "kind": "synthetic_model_recovery",
+      "test_rows": 21238,
+      "estimator": "LGBMClassifier",
+      "auc": 0.9504199870459723,
+      "baseline_auc": 0.5,
+      "auc_note": null,
+      "accuracy": 0.992089650626236,
+      "baseline_accuracy": 0.9923250776909314
+    }
+  }
+}
