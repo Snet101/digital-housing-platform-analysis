@@ -1,4 +1,4 @@
-# Reproducible rental prediction and platform simulation
+# Asking-rent prediction and a separate platform simulation
 
 This project combines observed apartment listings with an explicitly simulated platform environment. The original work was presented at the Stanford SC² Conference by Sanvi Nethikunta and Rithik Gumpu. This repair is a subsequent software revision; it does not retroactively validate the conference results.
 
@@ -6,7 +6,7 @@ This project combines observed apartment listings with an explicitly simulated p
 
 | Variables | Meaning |
 |---|---|
-| Rent, bedrooms, bathrooms, square feet, category, city label, description, amenities | Observed only when using an actual UCI snapshot; all are invented in the offline fixture |
+| Advertised asking rent, bedrooms, bathrooms, square feet, category, city and state, description, amenities | Observed only when using an actual UCI snapshot; all are invented in the offline fixture |
 | Platform, landlord ID, multihoming, exposure, platform shares, HHI | Simulated allocation and derived simulation variables |
 | Views, time on market, rented status | Generated outcomes, never observed rental performance |
 
@@ -44,7 +44,7 @@ The fetch saves input bytes, row count, source URL, and SHA256. Preserve `source
 
 ## Evaluation boundary
 
-The split holds out 25% of distinct city labels using a fixed seed. Cities do not overlap between training and test. A city label may conflate same-named cities in different states; it is not a verified neighborhood/geographic identifier. This evaluation tests prediction in unseen city labels, not future-time performance. Only positive rents below USD 10,000 with monthly price units, nonnegative beds/baths, positive square footage and nonempty category/city are retained. Missing descriptions and amenities become empty feature values. Listing duplicates are removed using the retained source columns; near-duplicate properties cannot be ruled out without reliable property identifiers.
+The split holds out 25% of distinct city/state groups using a fixed seed. Cities do not overlap between training and test. Grouping now uses normalized city plus two-letter state, keeping same-named cities in different states separate. Missing or malformed state values are excluded. These labels are not verified property or neighborhood identifiers. This evaluation tests prediction in unseen city/state groups, not future-time performance. Only positive rents below USD 10,000 with monthly price units, nonnegative beds/baths, positive square footage and nonempty category/city are retained. Missing descriptions and amenities become empty feature values. Listing duplicates are removed using the retained source columns; near-duplicate properties cannot be ruled out without reliable property identifiers.
 
 Observed rent prediction uses only bedrooms, bathrooms, square feet, description length, amenities count, category and city label. It excludes **all** simulated variables and **all** rent-derived group statistics. Explicit feature lists replace the old broad prefix selector. One-hot categories and numeric imputers are fitted only on training rows; unseen test categories are handled without refitting.
 
@@ -78,3 +78,9 @@ This saves all nine combinations of seeds 41/42/43 and curvatures 0/10/20. Withi
 `docs/historical/` preserves the original script, README and notebook, including historical outputs. Their unseeded simulations, leaking rent-dispersion feature and separate OLS realization are not reproduced as validated results. The repaired CLI does not run those files. SHAP and smoothed partial-dependence plots are retained only in the historical script; they are not required dependencies or evidence of causal effects. The repaired version favors saved predictions, clear baselines, shared OLS data and assumption sensitivity.
 
 See `docs/repair-notes.md` for verification and limits. GitHub Actions runs the offline checks after push.
+
+## Fixed geographic evaluation (October 2026 maintenance)
+
+Run `python geographic_evaluation.py --input PATH_TO_UCI_CSV --out runs/geographic`. The protocol in `docs/geographic-protocol.json` fixes five geographic folds and model settings before fitting. Each cleaned row is held out once. Reports include all folds, pooled MAE/RMSE, city/state errors and asking-rent bands, comparing LightGBM with mean, median and scaled Ridge baselines. No test-fold tuning or selection of a winning split is performed. Fold variation is descriptive, not an independent-sample confidence interval.
+
+Read `docs/focused-improvements.md` for the review walkthrough. These October 2026 changes were implemented with AI assistance after the original presentation and should be reviewed by the authors before describing them as personal work. Historical documents are preserved; their old numerical claims are not validated by this revision. The real-data target is advertised monthly asking rent, not completed transactions, occupancy, or a causal effect of platforms. All platform outcomes remain simulated.

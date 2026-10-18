@@ -24,14 +24,14 @@ def test_seed_reproducibility_and_shared_population(data):
 
 
 def test_city_boundary(data):
-    assert not set(data.loc[data.split.eq("train"), "cityname"]) & set(data.loc[data.split.eq("test"), "cityname"])
+    assert not set(data.loc[data.split.eq("train"), "geo_id"]) & set(data.loc[data.split.eq("test"), "geo_id"])
 
 
 def test_hhi_counts_not_listing_weighted(data):
     df = h.simulate(data, 42)
-    shares = df.groupby(["cityname", "platform"]).size() / df.groupby("cityname").size()
-    expected = shares.pow(2).groupby("cityname").sum()
-    np.testing.assert_allclose(df.hhi, df.cityname.map(expected))
+    shares = df.groupby(["geo_id", "platform"]).size() / df.groupby("geo_id").size()
+    expected = shares.pow(2).groupby("geo_id").sum()
+    np.testing.assert_allclose(df.hhi, df.geo_id.map(expected))
     assert df.hhi.between(1 / 3 - 1e-12, 1).all()
     assert df.platform_share.between(0, 1).all()
 
@@ -71,7 +71,7 @@ def test_cleaning_empty_amenities_and_duplicates():
     assert len(h.clean(raw)) == 480  # duplicate valid original is retained instead
 
 
-@pytest.mark.parametrize("column", ["price", "cityname", "body"])
+@pytest.mark.parametrize("column", ["price", "cityname", "state", "body"])
 def test_missing_schema_rejected(column):
     with pytest.raises(ValueError, match="Missing"):
         h.clean(pd.read_csv(FIXTURE).drop(columns=column))
