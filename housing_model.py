@@ -20,7 +20,7 @@ from sklearn.metrics import mean_squared_error, roc_auc_score, accuracy_score
 from lightgbm import LGBMRegressor, LGBMClassifier
 
 OBSERVED_NUMERIC = ["bedrooms", "bathrooms", "square_feet", "description_length", "amenities_count"]
-OBSERVED_CATEGORY = ["category", "cityname"]
+OBSERVED_CATEGORY = ["category", "geo_id", "state"]
 SYNTHETIC_NUMERIC = OBSERVED_NUMERIC + ["price", "multihomed", "exposure_score", "platform_share", "hhi"]
 SYNTHETIC_CATEGORY = OBSERVED_CATEGORY + ["platform"]
 PLATFORMS = ["Craigslist", "Zillow", "Apartments.com"]
@@ -31,6 +31,7 @@ REQUIRED = [
     "square_feet",
     "category",
     "cityname",
+    "state",
     "body",
     "amenities",
     "currency",
@@ -54,8 +55,10 @@ def clean(raw):
     df.insert(0, "row_id", np.arange(len(df)))
     for col in ["price", "bedrooms", "bathrooms", "square_feet"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    for col in ["category", "cityname", "currency", "price_type"]:
+    for col in ["category", "cityname", "state", "currency", "price_type"]:
         df[col] = df[col].fillna("").astype(str).str.strip()
+    df["state"] = df.state.str.upper()
+    df["cityname"] = df.cityname.str.replace(r"\s+", " ", regex=True).str.casefold()
     keep = (
         df.price.gt(0)
         & df.price.lt(10000)
@@ -63,28 +66,30 @@ def clean(raw):
         & df.bedrooms.ge(0)
         & df.bathrooms.ge(0)
         & df.cityname.ne("")
+        & df.state.str.fullmatch(r"[A-Z]{2}")
         & df.category.ne("")
         & df.currency.str.upper().eq("USD")
         & df.price_type.str.casefold().eq("monthly")
     )
     df = df.loc[keep].copy()
+    df["geo_id"] = df.cityname + "|" + df.state
     df["description_length"] = df.body.fillna("").astype(str).str.len()
     df["amenities_count"] = (
         df.amenities.fillna("").astype(str).map(lambda x: sum(bool(v.strip()) for v in x.split(",")))
     )
     # Identical retained source records must not count as independent observations.
     df = df.drop_duplicates(REQUIRED).reset_index(drop=True)
-    if len(df) < 20 or df.cityname.nunique() < 4:
+    if len(df) < 20 or df.geo_id.nunique() < 4:
         raise ValueError("Need at least 20 cleaned records across four cities")
     return df
 
 
 def split_cities(df, seed):
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
-    train, test = next(splitter.split(df, groups=df.cityname))
+    train, test = next(splitter.split(df, groups=df.geo_id))
     labels = np.full(len(df), "test", dtype=object)
     labels[train] = "train"
-    assert not set(df.iloc[train].cityname) & set(df.iloc[test].cityname)
+    assert not set(df.iloc[train].geo_id) & set(df.iloc[test].geo_id)
     return labels
 
 
@@ -92,20 +97,20 @@ def simulate(df, seed, curvature=10.0):
     """HHI uses listing counts only; no rent-derived aggregate is constructed."""
     rng = np.random.default_rng(seed)
     result = df.copy()
-    cities = sorted(result.cityname.unique())
+    cities = sorted(result.geo_id.unique())
     mixes = dict(zip(cities, rng.dirichlet([1, 1, 1], size=len(cities)), strict=True))
-    result["platform"] = [rng.choice(PLATFORMS, p=mixes[c]) for c in result.cityname]
-    counts = result.groupby(["cityname", "platform"]).size().rename("count").reset_index()
-    counts["platform_share"] = counts["count"] / counts.groupby("cityname")["count"].transform("sum")
-    hhi = counts.assign(square=counts.platform_share**2).groupby("cityname").square.sum().rename("hhi")
+    result["platform"] = [rng.choice(PLATFORMS, p=mixes[c]) for c in result.geo_id]
+    counts = result.groupby(["geo_id", "platform"]).size().rename("count").reset_index()
+    counts["platform_share"] = counts["count"] / counts.groupby("geo_id")["count"].transform("sum")
+    hhi = counts.assign(square=counts.platform_share**2).groupby("geo_id").square.sum().rename("hhi")
     result = result.merge(
-        counts[["cityname", "platform", "platform_share"]],
-        on=["cityname", "platform"],
+        counts[["geo_id", "platform", "platform_share"]],
+        on=["geo_id", "platform"],
         how="left",
         validate="many_to_one",
         sort=False,
     )
-    result = result.join(hhi, on="cityname", validate="many_to_one")
+    result = result.join(hhi, on="geo_id", validate="many_to_one")
     assert len(result) == len(df) and result.row_id.is_unique
     result["landlord_id"] = rng.integers(1000, 2000, size=len(result))
     result["multihomed"] = (result.landlord_id % 7 == 0).astype(int)
@@ -140,7 +145,7 @@ def preprocessor(synthetic=False):
 
 def fit_evaluate(df, seed):
     train, test = df.loc[df.split.eq("train")], df.loc[df.split.eq("test")]
-    metrics, predictions = {}, df.loc[df.split.eq("test"), ["row_id", "cityname"]].copy()
+    metrics, predictions = {}, df.loc[df.split.eq("test"), ["row_id", "cityname", "state", "geo_id"]].copy()
     for target in ["price", "time_on_market", "views", "rented"]:
         binary = target == "rented"
         synthetic = target != "price"

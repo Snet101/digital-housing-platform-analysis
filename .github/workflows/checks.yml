@@ -13,7 +13,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libgomp1
       - run: python -m pip install -r requirements-dev.lock.txt
       - run: python -m pip check
-      - run: python -m ruff check housing_model.py scripts tests
+      - run: python -m ruff check housing_model.py geographic_evaluation.py scripts tests
       - run: python -m pytest -q
       - run: python housing_model.py --input tests/fixtures/listings.csv --out runs/fixture
+      - run: python geographic_evaluation.py --input tests/fixtures/listings.csv --out runs/geographic-fixture
       - run: python scripts/check_notebook.py
