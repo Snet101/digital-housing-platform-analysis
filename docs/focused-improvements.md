@@ -48,4 +48,4 @@ For an interview, explain what you originally built, the original leakage/simula
 5. Run `python geographic_evaluation.py --input YOUR_UCI_SNAPSHOT.csv --out runs/geographic` in a new output directory. The original source snapshot SHA-256 is `dba71c5b6947a7524fc4bd4ab597daaa5f2c40ac1b0435129e392add607be291`.
 6. Open `metrics.json`, `errors-by-city.csv`, `errors-by-rent-band.csv` and `cleaning-audit.json`. `predictions.csv` contains every held-out prediction and can reproduce the aggregate metrics.
 
-The GitHub workflow adds a fixture geographic run and linting of the new evaluator. Local validation and delivery details are recorded in the accompanying `REVIEW-START-HERE.md`; hosted CI remains pending a push.
+The GitHub workflow runs automated tests, linting, a fixture geographic evaluation, and the OLS notebook. These checks passed on the revision branch and after merging into main. The full UCI evaluation was run locally; its results are summarized above.
